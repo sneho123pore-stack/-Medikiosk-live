@@ -1,0 +1,13 @@
+streamlit
+pymongo
+dnspython
+SpeechRecognition
+audio-recorder-streamlit
+requests
+folium
+streamlit-folium
+geopy
+google-genai
+streamlit-drawable-canvas
+pillow
+streamlit-geolocation
