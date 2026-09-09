@@ -398,4 +398,79 @@ else:
 
         # 3. Hospital Locator (True GPS + AI-Powered Govt Search)
         with tab_hospitals:
-            st.subheader("Locate Government Healt
+            st.subheader("Locate Government Healthcare Facilities")
+            st.caption("Prioritizes local government health centers within 10 km, followed by regional tertiary medical colleges.")
+            
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.markdown("**📍 Option 1: Live GPS Location**")
+                gps_loc = streamlit_geolocation()
+            with col2:
+                st.markdown("**⌨️ Option 2: Manual Location**")
+                location_query = st.text_input("Enter City, Town, or Pincode:", placeholder="e.g., North Dumdum, Kolkata", label_visibility="collapsed")
+                manual_search = st.button("Search by Text", type="primary")
+
+            if manual_search and location_query.strip():
+                st.session_state.search_type = "manual"
+                st.session_state.search_val = location_query
+            elif gps_loc and gps_loc.get('latitude') is not None:
+                st.session_state.search_type = "gps"
+                st.session_state.search_val = gps_loc
+
+            if st.session_state.get("search_type"):
+                with st.spinner("Triangulating public health centers and regional medical colleges..."):
+                    try:
+                        lat, lon = None, None
+                        search_context = ""
+                        
+                        if st.session_state.search_type == "manual":
+                            loc = Nominatim(user_agent="medikiosk_sih_v2").geocode(st.session_state.search_val)
+                            if loc:
+                                lat, lon = loc.latitude, loc.longitude
+                                search_context = f"the area of '{st.session_state.search_val}'"
+                        elif st.session_state.search_type == "gps":
+                            lat = st.session_state.search_val['latitude']
+                            lon = st.session_state.search_val['longitude']
+                            search_context = f"coordinates Latitude {lat}, Longitude {lon}"
+                        
+                        if lat and lon:
+                            prompt = f"""
+                            You are a geospatial health directory for Indian public healthcare.
+                            Given the center location at {search_context} (Lat: {lat}, Lon: {lon}):
+                            Identify real, government-run health institutions divided strictly into two categories:
+                            1. LOCAL TIER (Strictly within a 10 km radius):
+                               - Focus on: Sub-Divisional Hospitals (SDH), State General Hospitals (SGH), Urban Primary Health Centres (UPHC).
+                               - Provide up to 6 real facilities.
+                            2. REGIONAL REFERRAL TIER (Beyond 10 km radius):
+                               - Major landmark Government Medical Colleges and apex state tertiary referral hospitals.
+                               - Provide up to 4 major facilities.
+                            Return strictly a raw JSON array of objects without any markdown formatting or backticks:
+                            [
+                              {{
+                                "name": "Hospital Name",
+                                "type": "State General Hospital / Medical College / UPHC",
+                                "tier": "Within 10 km" or "Regional (>10km)",
+                                "lat": 22.1234,
+                                "lon": 88.1234
+                              }}
+                            ]
+                            """
+                            response = ai_client.models.generate_content(model="gemini-1.5-pro", contents=prompt)
+                            raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                            hospitals_data = json.loads(raw_text)
+                            
+                            local_facilities = [h for h in hospitals_data if h.get("tier") == "Within 10 km"]
+                            regional_facilities = [h for h in hospitals_data if h.get("tier") != "Within 10 km"]
+                            
+                            m = folium.Map(location=[lat, lon], zoom_start=11)
+                            folium.Marker([lat, lon], popup="📍 Patient Location", icon=folium.Icon(color="blue", icon="user")).add_to(m)
+                            folium.Circle(location=[lat, lon], radius=10000, color="#2b8cbe", weight=2, fill=True, fill_opacity=0.15).add_to(m)
+                            
+                            for h in local_facilities:
+                                folium.Marker([h["lat"], h["lon"]], popup=f"🟢 {h['name']}", icon=folium.Icon(color="green", icon="plus")).add_to(m)
+                            for h in regional_facilities:
+                                folium.Marker([h["lat"], h["lon"]], popup=f"🏛️ {h['name']}", icon=folium.Icon(color="darkred", icon="star")).add_to(m)
+                                
+                            st_folium(m, width=850, height=520, returned_objects=[])
+                    except Exception as e:
+                        st.error(f"Error mapping facilities. Please try again.")
