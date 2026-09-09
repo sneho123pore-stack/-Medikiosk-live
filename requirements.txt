@@ -1,7 +1,6 @@
 streamlit
 pymongo
 dnspython
-SpeechRecognition
 audio-recorder-streamlit
 requests
 folium
@@ -11,3 +10,4 @@ google-genai
 streamlit-drawable-canvas
 pillow
 streamlit-geolocation
+numpy
