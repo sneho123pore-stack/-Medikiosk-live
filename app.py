@@ -3,7 +3,6 @@ from pymongo import MongoClient
 import hashlib
 from datetime import datetime
 import random
-import requests
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
@@ -21,7 +20,8 @@ from streamlit_geolocation import streamlit_geolocation
 # 1. DATABASE & AI CONFIGURATION
 # ---------------------------------------------------------
 MONGO_URI = st.secrets["MONGO_URI"]
-GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+KEY_1 = st.secrets["GEMINI_API_KEY_1"]
+KEY_2 = st.secrets.get("GEMINI_API_KEY_2", KEY_1) # Safely defaults to Key 1 if Key 2 isn't set
 MASTER_DOCTOR_KEY = "DOC-SECURE-2026"
 
 @st.cache_resource
@@ -33,8 +33,26 @@ db = get_database()
 users_col = db["users"]
 intakes_col = db["intakes"]
 
-# Initialize Gemini AI (Using Pro for maximum accuracy)
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# Initialize two separate clients for load balancing
+client_1 = genai.Client(api_key=KEY_1)
+client_2 = genai.Client(api_key=KEY_2)
+
+# --- THE TRIPLE-THREAT FALLBACK MECHANISM ---
+def safe_ai_request(prompt_contents, primary="gemini-2.5-flash", fallback="gemini-1.5-flash"):
+    """Tries Key 1, then Key 2, then falls back to a secondary model."""
+    # Attempt 1: Primary Model with Key 1
+    try:
+        return client_1.models.generate_content(model=primary, contents=prompt_contents)
+    except Exception as e1:
+        # Attempt 2: Primary Model with Key 2 (Fixes 429 Rate Limits)
+        try:
+            return client_2.models.generate_content(model=primary, contents=prompt_contents)
+        except Exception as e2:
+            # Attempt 3: Backup Model with Key 1 (Fixes 503 Server Overloads)
+            try:
+                return client_1.models.generate_content(model=fallback, contents=prompt_contents)
+            except Exception as e3:
+                raise Exception(f"All AI fail-safes triggered. Latest error: {e3}")
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -195,22 +213,19 @@ else:
             
             record = next(r for r in pending_records if r["intake_id"] == selected_intake)
             
-            st.info(f"**🤖 AI Clinical Summary (Gemini 1.5 Pro):**\n\n{record.get('ai_summary', 'Pending')}")
+            st.info(f"**🤖 AI Clinical Summary:**\n\n{record.get('ai_summary', 'Pending')}")
             
             col_doc1, col_doc2 = st.columns(2)
             with col_doc1:
                 st.write(f"**Extracted Medications:**\n{record.get('current_meds', 'None provided')}")
-                if record.get('current_meds') not in ["None provided", "N/A", "None", "Illegible - Manual Review Needed"]:
+                if record.get('current_meds') not in ["None provided", "N/A", "None", "Illegible - Manual Review Needed", "None extracted.", "Check summary for details (Formatting Error)"]:
                     if st.button("🔍 Suggest Generic Alternatives"):
                         with st.spinner("Finding cost-effective alternatives..."):
                             try:
-                                alt_response = ai_client.models.generate_content(
-                                    model="gemini-1.5-pro",
-                                    contents=f"List low-cost generic alternatives for these medications: {record.get('current_meds')}. Keep it brief."
-                                )
+                                alt_response = safe_ai_request(f"List low-cost generic alternatives for these medications: {record.get('current_meds')}. Keep it brief.")
                                 st.success(alt_response.text)
-                            except:
-                                st.error("AI service unavailable.")
+                            except Exception as e:
+                                st.error(f"AI service unavailable: {e}")
             with col_doc2:
                 if record.get('document_b64'):
                     st.write("**Patient Uploaded Document:**")
@@ -236,15 +251,16 @@ else:
             
             if st.button("✍️ Send to Patient for Final Consent", type="primary"):
                 sig_b64 = ""
-                if canvas_result.image_data is not None:
-                    try:
+                # Secure try-except to prevent drawing pad crash on Streamlit cloud
+                try:
+                    if canvas_result is not None and canvas_result.image_data is not None:
                         img_np = canvas_result.image_data
                         img_pil = Image.fromarray(img_np.astype('uint8'), 'RGBA')
                         buffered = io.BytesIO()
                         img_pil.save(buffered, format="PNG")
                         sig_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                    except Exception as e:
-                        st.error("Error processing signature. Proceeding without visual signature.")
+                except Exception:
+                    pass
                 
                 doctor_full_title = f"Dr. {st.session_state.username}, {st.session_state.hospital_name}"
                 
@@ -279,13 +295,11 @@ else:
                 st.audio(audio_bytes, format="audio/wav")
                 with st.spinner("AI is precisely transcribing and translating your audio..."):
                     try:
-                        response = ai_client.models.generate_content(
-                            model="gemini-1.5-pro", 
-                            contents=[
-                                genai.types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                                "Transcribe this audio precisely. If it is in a regional Indian language, translate it strictly and accurately into clinical English. Return only the final text."
-                            ]
-                        )
+                        audio_prompt = [
+                            genai.types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                            "Transcribe this audio precisely. If it is in a regional Indian language, translate it strictly and accurately into clinical English. Return only the final text."
+                        ]
+                        response = safe_ai_request(audio_prompt)
                         recognized_text = response.text.strip()
                         st.success("Audio accurately transcribed by AI!")
                     except Exception as e:
@@ -307,48 +321,55 @@ else:
                             img_part = Image.open(io.BytesIO(doc_bytes))
                             ai_contents.insert(0, img_part)
                         
-                        # Ultra-High Precision Clinical Prompt
+                        # Bulletproof JSON Clinical Prompt
                         ai_contents.append("""
-                        You are an expert clinical AI assistant. 
+                        You are an expert clinical AI assistant. Analyze the provided symptoms and/or medical document (prescription, lab report, or clinical notes).
                         
-                        Task 1 (Symptom Summary): Create a precise, professional medical summary of the patient's reported symptoms and duration. Translate to clinical English if spoken in a regional language.
+                        1. Create a precise, professional medical summary. Translate to English if needed.
+                        2. Extract a list of all medications, dosages, and instructions. If a document is uploaded but no medications are present, extract the key medical findings instead.
+                        3. If handwriting is genuinely illegible, write '[ILLEGIBLE - MANUAL REVIEW REQUIRED]'.
                         
-                        Task 2 (Prescription/Document Analysis): Carefully analyze the attached image. 
-                        - Accurately transcribe all medication names, dosages (e.g., 500mg), and frequencies (e.g., 1-0-1, OD, BD).
-                        - Translate any regional language instructions into clear English.
-                        - CRITICAL: If a word or dosage is genuinely illegible, you must write '[ILLEGIBLE - MANUAL REVIEW REQUIRED]'. You are strictly forbidden from guessing or hallucinating drug names.
-                        
-                        Format your response strictly as:
-                        Summary: <precise clinical summary>
-                        Medications: <detailed medication list with dosages and instructions>
+                        CRITICAL: You MUST respond STRICTLY with a valid JSON object. Do not include markdown formatting, backticks, or introductory text.
+                        Use exactly this format:
+                        {
+                          "summary": "your detailed clinical summary here",
+                          "medications": "1. Med name - dosage\n2. Med name - dosage"
+                        }
                         """)
                         
                         try:
-                            response = ai_client.models.generate_content(model="gemini-1.5-pro", contents=ai_contents)
-                            ai_text = response.text
-                            if "Summary:" in ai_text and "Medications:" in ai_text:
-                                parts = ai_text.split("Medications:")
-                                summary = parts[0].replace("Summary:", "").strip()
-                                meds = parts[1].strip()
-                            else:
-                                summary, meds = ai_text, "N/A"
-                        except:
-                            summary, meds = "AI Processing Failed", "N/A"
-                        
-                        intakes_col.insert_one({
-                            "intake_id": f"IN-{random.randint(10000, 99999)}",
-                            "patient_id": st.session_state.unique_id,
-                            "patient_username": st.session_state.username,
-                            "symptoms": symptoms,
-                            "duration": duration,
-                            "ai_summary": summary,
-                            "current_meds": meds if uploaded_file else "None provided",
-                            "document_b64": doc_b64,
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "status": "Awaiting Review",
-                            "signed_by": "Pending"
-                        })
-                        st.success("Case submitted successfully!")
+                            # Use our new bulletproof fallback function
+                            response = safe_ai_request(ai_contents)
+                            
+                            raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                            
+                            # Safely extract the JSON data
+                            try:
+                                parsed_data = json.loads(raw_text)
+                                summary = parsed_data.get("summary", "Summary could not be generated.")
+                                meds = parsed_data.get("medications", "None extracted.")
+                            except json.JSONDecodeError:
+                                summary = raw_text
+                                meds = "Check summary for details (Formatting Error)"
+                                
+                            intakes_col.insert_one({
+                                "intake_id": f"IN-{random.randint(10000, 99999)}",
+                                "patient_id": st.session_state.unique_id,
+                                "patient_username": st.session_state.username,
+                                "symptoms": symptoms,
+                                "duration": duration,
+                                "ai_summary": summary,
+                                "current_meds": meds if uploaded_file else "None provided",
+                                "document_b64": doc_b64,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "status": "Awaiting Review",
+                                "signed_by": "Pending"
+                            })
+                            st.success("Case submitted successfully to the Doctor Queue!")
+                            
+                        except Exception as e:
+                            st.error(f"Google AI Server Error: {e}")
+                            st.warning("⚠️ The AI server is experiencing extremely high traffic. Please try again in a moment.")
                 else:
                     st.warning("Please enter your symptoms.")
         
@@ -455,7 +476,9 @@ else:
                               }}
                             ]
                             """
-                            response = ai_client.models.generate_content(model="gemini-1.5-pro", contents=prompt)
+                            # Use our bulletproof fallback function here too!
+                            response = safe_ai_request(prompt)
+                            
                             raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                             hospitals_data = json.loads(raw_text)
                             
@@ -473,4 +496,4 @@ else:
                                 
                             st_folium(m, width=850, height=520, returned_objects=[])
                     except Exception as e:
-                        st.error(f"Error mapping facilities. Please try again.")
+                        st.error(f"Error mapping facilities. Please try again. Details: {e}")
