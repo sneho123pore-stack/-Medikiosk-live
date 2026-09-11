@@ -21,7 +21,7 @@ from streamlit_geolocation import streamlit_geolocation
 # ---------------------------------------------------------
 MONGO_URI = st.secrets["MONGO_URI"]
 KEY_1 = st.secrets["GEMINI_API_KEY_1"]
-KEY_2 = st.secrets.get("GEMINI_API_KEY_2", KEY_1) # Safely defaults to Key 1 if Key 2 isn't set
+KEY_2 = st.secrets.get("GEMINI_API_KEY_2", KEY_1) 
 MASTER_DOCTOR_KEY = "DOC-SECURE-2026"
 
 @st.cache_resource
@@ -37,22 +37,35 @@ intakes_col = db["intakes"]
 client_1 = genai.Client(api_key=KEY_1)
 client_2 = genai.Client(api_key=KEY_2)
 
-# --- THE TRIPLE-THREAT FALLBACK MECHANISM ---
-def safe_ai_request(prompt_contents, primary="gemini-2.5-flash", fallback="gemini-1.5-flash"):
-    """Tries Key 1, then Key 2, then falls back to a secondary model."""
-    # Attempt 1: Primary Model with Key 1
-    try:
-        return client_1.models.generate_content(model=primary, contents=prompt_contents)
-    except Exception as e1:
-        # Attempt 2: Primary Model with Key 2 (Fixes 429 Rate Limits)
-        try:
-            return client_2.models.generate_content(model=primary, contents=prompt_contents)
-        except Exception as e2:
-            # Attempt 3: Backup Model with Key 1 (Fixes 503 Server Overloads)
+# --- THE ULTIMATE MULTI-GENERATION FALLBACK MECHANISM ---
+def safe_ai_request(prompt_contents):
+    """Iterates through all Flash models (3.8 down to 2.5) across all available API keys."""
+    flash_models = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash"
+    ]
+    clients = [client_1, client_2]
+    last_error = None
+    
+    for model_name in flash_models:
+        for client in clients:
             try:
-                return client_1.models.generate_content(model=fallback, contents=prompt_contents)
-            except Exception as e3:
-                raise Exception(f"All AI fail-safes triggered. Latest error: {e3}")
+                return client.models.generate_content(model=model_name, contents=prompt_contents)
+            except Exception as e:
+                last_error = e
+                continue 
+                
+    for client in clients:
+        try:
+            return client.models.generate_content(model="gemini-3.1-pro-preview", contents=prompt_contents)
+        except Exception as e:
+            last_error = e
+            continue
+            
+    raise Exception(f"All AI fail-safes (3.8 down to 2.5) exhausted. Latest error: {last_error}")
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -193,21 +206,35 @@ else:
     if st.session_state.role == "Doctor":
         st.title("🩺 Live Physician OPD Dashboard")
         
-        records = list(intakes_col.find({}, {"_id": 0}).sort("timestamp", -1))
+        # --- THE REAL-TIME RADAR (Auto-refreshes every 5 seconds) ---
+        @st.fragment(run_every="5s")
+        def live_radar_queue():
+            live_records = list(intakes_col.find({}, {"_id": 0}).sort("timestamp", -1))
+            live_pending = [r for r in live_records if r.get("status") == "Awaiting Review" and "intake_id" in r]
+            
+            if not live_pending:
+                st.success("🎉 No pending patient intake submissions in the queue!")
+            else:
+                st.subheader("📡 Live Patient Radar (Auto-Updating)")
+                queue_data = [{"ID": r.get("patient_id"), "Patient": r.get("patient_username"), "Symptoms": r.get("symptoms")} for r in live_pending]
+                st.dataframe(queue_data, use_container_width=True)
+                
+        live_radar_queue()
         
-        # Filter for strictly pending ones
+        st.markdown("---")
+        
+        col_sync1, col_sync2 = st.columns([8, 2])
+        with col_sync1:
+            st.subheader("✍️ Clinical Review & Sign-Off")
+        with col_sync2:
+            # Manual sync button ensures the doctor's text inputs don't get erased mid-typing by an auto-refresh
+            st.button("🔄 Sync Dropdown", use_container_width=True)
+            
+        # Fetch data for the static interaction zone
+        records = list(intakes_col.find({}, {"_id": 0}).sort("timestamp", -1))
         pending_records = [r for r in records if r.get("status") == "Awaiting Review" and "intake_id" in r]
         
-        if not pending_records:
-            st.success("🎉 No pending patient intake submissions in the queue!")
-        else:
-            st.subheader("Incoming Patient Queue")
-            queue_data = [{"ID": r.get("patient_id"), "Patient": r.get("patient_username"), "Symptoms": r.get("symptoms")} for r in pending_records]
-            st.dataframe(queue_data, use_container_width=True)
-            
-            st.markdown("---")
-            st.subheader("✍️ Clinical Review & Sign-Off")
-            
+        if pending_records:
             pending_options = {r["intake_id"]: f"{r.get('patient_username')} (ID: {r.get('patient_id')})" for r in pending_records}
             selected_intake = st.selectbox("Select a patient record to review:", options=list(pending_options.keys()), format_func=lambda x: pending_options[x])
             
@@ -251,7 +278,6 @@ else:
             
             if st.button("✍️ Send to Patient for Final Consent", type="primary"):
                 sig_b64 = ""
-                # Secure try-except to prevent drawing pad crash on Streamlit cloud
                 try:
                     if canvas_result is not None and canvas_result.image_data is not None:
                         img_np = canvas_result.image_data
@@ -321,7 +347,6 @@ else:
                             img_part = Image.open(io.BytesIO(doc_bytes))
                             ai_contents.insert(0, img_part)
                         
-                        # Bulletproof JSON Clinical Prompt
                         ai_contents.append("""
                         You are an expert clinical AI assistant. Analyze the provided symptoms and/or medical document (prescription, lab report, or clinical notes).
                         
@@ -338,12 +363,9 @@ else:
                         """)
                         
                         try:
-                            # Use our new bulletproof fallback function
                             response = safe_ai_request(ai_contents)
-                            
                             raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                             
-                            # Safely extract the JSON data
                             try:
                                 parsed_data = json.loads(raw_text)
                                 summary = parsed_data.get("summary", "Summary could not be generated.")
@@ -375,47 +397,73 @@ else:
         
         # 2. History & Consent View
         with tab_history:
-            st.subheader("Your Records & Pending Approvals")
-            my_records = list(intakes_col.find({"patient_username": st.session_state.username}, {"_id": 0}).sort("timestamp", -1))
-            
-            if not my_records:
-                st.info("No records found.")
-            else:
-                for rec in my_records:
-                    with st.container(border=True):
-                        col1, col2 = st.columns([3, 1])
-                        with col1:
-                            st.write(f"**Symptoms:** {rec.get('symptoms')}")
+            # --- THE PATIENT'S LIVE ZONE (Auto-refreshes every 5 seconds) ---
+            @st.fragment(run_every="5s")
+            def live_patient_records():
+                st.subheader("Your Records & Pending Approvals (Live 🟢)")
+                my_records = list(intakes_col.find({"patient_username": st.session_state.username}, {"_id": 0}).sort("timestamp", -1))
+                
+                if not my_records:
+                    st.info("No records found.")
+                else:
+                    for rec in my_records:
+                        with st.container(border=True):
+                            col1, col2 = st.columns([3, 1])
                             
-                            if rec.get('status') == "Consent Requested":
-                                st.error("⚠️ **Doctor Review Completed - Consent Required**")
-                                st.write(f"**Prescribing Doctor:** {rec.get('pending_signed_by')}")
-                                st.write(f"**Proposed Treatment:** {rec.get('pending_prescription')}")
+                            with col1:
+                                st.write(f"**Symptoms:** {rec.get('symptoms')}")
                                 
-                                if st.button(f"✅ I agree to finalize this visit (ID: {rec['intake_id']})", type="primary", key=f"approve_{rec['intake_id']}"):
-                                    intakes_col.update_one(
-                                        {"intake_id": rec['intake_id']},
-                                        {"$set": {
-                                            "status": "Reviewed",
-                                            "signed_by": rec['pending_signed_by'],
-                                            "prescription": rec['pending_prescription'],
-                                            "signature_b64": rec.get('pending_signature_b64', '')
-                                        }}
-                                    )
-                                    st.rerun()
-                            
-                            elif rec.get('prescription'):
-                                st.success(f"**Prescribed Treatment:**\n\n{rec['prescription']}")
+                                if rec.get('status') == "Consent Requested":
+                                    st.error("⚠️ **Doctor Review Completed - Consent Required**")
+                                    st.write(f"**Prescribing Doctor:** {rec.get('pending_signed_by')}")
+                                    st.write(f"**Proposed Treatment:** {rec.get('pending_prescription')}")
+                                    
+                                    if st.button("💊 Check Generic Alternatives", key=f"alt_pend_{rec['intake_id']}"):
+                                        with st.spinner("Finding affordable alternatives..."):
+                                            try:
+                                                alt_res = safe_ai_request(f"Provide cheap generic medicine alternatives for these prescribed medicines: {rec.get('pending_prescription')}. Keep it brief.")
+                                                st.info(f"**AI Generic Suggestions:**\n{alt_res.text}")
+                                            except Exception as e:
+                                                st.error("AI servers busy. Please try again.")
+
+                                    if st.button(f"✅ I agree to finalize this visit (ID: {rec['intake_id']})", type="primary", key=f"approve_{rec['intake_id']}"):
+                                        intakes_col.update_one(
+                                            {"intake_id": rec['intake_id']},
+                                            {"$set": {
+                                                "status": "Reviewed",
+                                                "signed_by": rec['pending_signed_by'],
+                                                "prescription": rec['pending_prescription'],
+                                                "signature_b64": rec.get('pending_signature_b64', '')
+                                            }}
+                                        )
+                                        st.rerun() # Forces the whole page out of the fragment loop once completed
                                 
-                        with col2:
-                            if rec.get('status') == "Reviewed":
-                                st.write(f"✅ **Signed By:**\n{rec.get('signed_by', '')}")
-                                if rec.get('signature_b64'):
-                                    st.image(base64.b64decode(rec['signature_b64']), width=150)
-                            elif rec.get('status') == "Consent Requested":
-                                st.warning("✋ Awaiting Your Approval")
-                            else:
-                                st.warning("⏳ In Doctor Queue")
+                                elif rec.get('prescription'):
+                                    st.success(f"**Prescribed Treatment:**\n\n{rec['prescription']}")
+                                    
+                                    if st.button("💊 Check Generic Alternatives", key=f"alt_done_{rec['intake_id']}"):
+                                        with st.spinner("Finding affordable alternatives..."):
+                                            try:
+                                                alt_res = safe_ai_request(f"Provide cheap generic medicine alternatives for these prescribed medicines: {rec.get('prescription')}. Keep it brief.")
+                                                st.info(f"**AI Generic Suggestions:**\n{alt_res.text}")
+                                            except Exception as e:
+                                                st.error("AI servers busy. Please try again.")
+                                    
+                            with col2:
+                                if rec.get('status') == "Reviewed":
+                                    st.write(f"✅ **Signed By:**\n{rec.get('signed_by', '')}")
+                                    if rec.get('signature_b64'):
+                                        st.image(base64.b64decode(rec['signature_b64']), width=150)
+                                elif rec.get('status') == "Consent Requested":
+                                    st.warning("✋ Awaiting Your Approval")
+                                    st.write("**Doctor Signature:**")
+                                    if rec.get('pending_signature_b64'):
+                                        st.image(base64.b64decode(rec['pending_signature_b64']), width=100)
+                                else:
+                                    st.warning("⏳ In Doctor Queue")
+
+            # Call the live records function
+            live_patient_records()
 
         # 3. Hospital Locator (True GPS + AI-Powered Govt Search)
         with tab_hospitals:
@@ -476,9 +524,7 @@ else:
                               }}
                             ]
                             """
-                            # Use our bulletproof fallback function here too!
                             response = safe_ai_request(prompt)
-                            
                             raw_text = response.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                             hospitals_data = json.loads(raw_text)
                             
